@@ -5,7 +5,7 @@ from queue import Queue
 from dataclasses import dataclass, field
 import sounddevice as sd
 from transformers import HfArgumentParser
-
+import wave  # Add this import
 
 @dataclass
 class ListenAndPlayArguments:
@@ -16,9 +16,9 @@ class ListenAndPlayArguments:
         }
     )
     recv_rate: int = field(
-        default=44100,
+        default=16000,
         metadata={
-            "help": "In Hz. Default is 44100."
+            "help": "In Hz. Default is 16000."
         }
     )
     list_play_chunk_size: int = field(
@@ -45,6 +45,18 @@ class ListenAndPlayArguments:
             "help": "The network port for receiving data. Default is 12346."
         }
     )
+    text_port: int = field(
+        default=12347,
+        metadata={
+            "help": "The port for receiving text. Default is 12347."
+        }
+    )
+    debug: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, sends a sample audio at the beginning"
+        }
+    )
 
 
 def listen_and_play(
@@ -54,13 +66,21 @@ def listen_and_play(
     host="localhost",
     send_port=12345,
     recv_port=12346,
+    text_port=12347,
+    debug=False,
 ):
-  
+    
+    print(f"Listening on {host}:{recv_port} and playing on {host}:{send_port}.")
+    print(f"Text will be received on {host}:{text_port}.")
+
     send_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     send_socket.connect((host, send_port))
 
     recv_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     recv_socket.connect((host, recv_port))
+
+    text_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    text_socket.connect((host, text_port))
 
     print("Recording and streaming...")
 
@@ -82,6 +102,40 @@ def listen_and_play(
             send_queue.put(data)
 
     def send(stop_event, send_queue):
+        if debug:
+            try:
+                # Send audio file once
+                with wave.open('kano.wav', 'rb') as wave_file:
+                    # Read audio parameters
+                    original_rate = wave_file.getframerate()
+                    print(f"Original rate: {original_rate}")
+                    
+                    # Read all frames and convert to numpy array
+                    frames = wave_file.readframes(wave_file.getnframes())
+                    audio_data = np.frombuffer(frames, dtype=np.int16)
+                    
+                    # Resample to 16000Hz if needed
+                    if original_rate != 16000:
+                        samples = len(audio_data)
+                        new_samples = int(samples * 16000 / original_rate)
+                        audio_data = np.interp(
+                            np.linspace(0, samples, new_samples),
+                            np.arange(samples),
+                            audio_data
+                        ).astype(np.int16)
+                    
+                    # Send resampled data in chunks
+                    for i in range(0, len(audio_data), list_play_chunk_size):
+                        chunk = audio_data[i:i + list_play_chunk_size].tobytes()
+                        send_socket.sendall(chunk)
+                
+                print("Finished sending debug, switching to microphone...")
+            except FileNotFoundError:
+                print("Error: debug audio not found in current directory")
+            # stop_event.set()
+            # return
+                
+        # Continue with normal microphone streaming
         while not stop_event.is_set():
             data = send_queue.get()
             send_socket.sendall(data)
@@ -102,6 +156,15 @@ def listen_and_play(
             if data:
                 recv_queue.put(data)
 
+    def recv_text(stop_event):
+        print("Receiving text...")
+        while not stop_event.is_set():
+            data = text_socket.recv(1024)
+            if not data:
+                break
+            text_decoded = data.decode('utf-8').strip()
+            print(text_decoded)
+
     try: 
         send_stream = sd.RawInputStream(samplerate=send_rate, channels=1, dtype='int16', blocksize=list_play_chunk_size, callback=callback_send)
         recv_stream = sd.RawOutputStream(samplerate=recv_rate, channels=1, dtype='int16', blocksize=list_play_chunk_size, callback=callback_recv)
@@ -112,7 +175,10 @@ def listen_and_play(
         send_thread.start()
         recv_thread = threading.Thread(target=recv, args=(stop_event, recv_queue))
         recv_thread.start()
-        
+
+        text_thread = threading.Thread(target=recv_text, args=(stop_event,))
+        text_thread.start()
+
         input("Press Enter to stop...")
 
     except KeyboardInterrupt:
@@ -122,6 +188,7 @@ def listen_and_play(
         stop_event.set()
         recv_thread.join()
         send_thread.join()
+        text_socket.close()
         send_socket.close()
         recv_socket.close()
         print("Connection closed.")

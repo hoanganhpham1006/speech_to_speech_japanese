@@ -11,10 +11,12 @@ from threading import Event, Thread
 from time import perf_counter
 from typing import Optional
 
-from LLM.mlx_lm import MLXLanguageModelHandler
+# from LLM.mlx_lm import MLXLanguageModelHandler
+from LLM.openai_api_language_model import OpenApiModelHandler
 from TTS.melotts import MeloTTSHandler
 from baseHandler import BaseHandler
-from STT.lightning_whisper_mlx_handler import LightningWhisperSTTHandler
+# from STT.lightning_whisper_mlx_handler import LightningWhisperSTTHandler
+from STT.whisper_stt_handler import WhisperSTTHandler
 import numpy as np
 import torch
 from nltk.tokenize import sent_tokenize
@@ -31,7 +33,10 @@ from transformers import (
 #from parler_tts import ParlerTTSForConditionalGeneration, ParlerTTSStreamer
 import librosa
 
-from local_audio_streamer import LocalAudioStreamer
+# from connections.local_audio_streamer import LocalAudioStreamer
+from connections.socket_receiver import SocketReceiver
+from connections.socket_sender import SocketSender
+from connections.socket_text_sender import SocketTextSender
 from utils import VADIterator, int2float, next_power_of_2
 
 # Ensure that the necessary NLTK resources are available
@@ -116,60 +121,6 @@ class SocketReceiverArguments:
         },
     )
 
-
-class SocketReceiver:
-    """
-    Handles reception of the audio packets from the client.
-    """
-
-    def __init__(
-        self,
-        stop_event,
-        queue_out,
-        should_listen,
-        host="0.0.0.0",
-        port=12345,
-        chunk_size=1024,
-    ):
-        self.stop_event = stop_event
-        self.queue_out = queue_out
-        self.should_listen = should_listen
-        self.chunk_size = chunk_size
-        self.host = host
-        self.port = port
-
-    def receive_full_chunk(self, conn, chunk_size):
-        data = b""
-        while len(data) < chunk_size:
-            packet = conn.recv(chunk_size - len(data))
-            if not packet:
-                # connection closed
-                return None
-            data += packet
-        return data
-
-    def run(self):
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.socket.bind((self.host, self.port))
-        self.socket.listen(1)
-        logger.info("Receiver waiting to be connected...")
-        self.conn, _ = self.socket.accept()
-        logger.info("receiver connected")
-
-        self.should_listen.set()
-        while not self.stop_event.is_set():
-            audio_chunk = self.receive_full_chunk(self.conn, self.chunk_size)
-            if audio_chunk is None:
-                # connection closed
-                self.queue_out.put(b"END")
-                break
-            if self.should_listen.is_set():
-                self.queue_out.put(audio_chunk)
-        self.conn.close()
-        logger.info("Receiver closed")
-
-
 @dataclass
 class SocketSenderArguments:
     send_host: str = field(
@@ -186,34 +137,21 @@ class SocketSenderArguments:
         },
     )
 
-
-class SocketSender:
-    """
-    Handles sending generated audio packets to the clients.
-    """
-
-    def __init__(self, stop_event, queue_in, host="0.0.0.0", port=12346):
-        self.stop_event = stop_event
-        self.queue_in = queue_in
-        self.host = host
-        self.port = port
-
-    def run(self):
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.socket.bind((self.host, self.port))
-        self.socket.listen(1)
-        logger.info("Sender waiting to be connected...")
-        self.conn, _ = self.socket.accept()
-        logger.info("sender connected")
-
-        while not self.stop_event.is_set():
-            audio_chunk = self.queue_in.get()
-            self.conn.sendall(audio_chunk)
-            if isinstance(audio_chunk, bytes) and audio_chunk == b"END":
-                break
-        self.conn.close()
-        logger.info("Sender closed")
+@dataclass
+class SocketTextSenderArguments:
+    text_host: str = field(
+        default="localhost",
+        metadata={
+            "help": "The host IP address for the text socket connection. Default is '0.0.0.0' which binds to all "
+            "available interfaces on the host machine."
+        },
+    )
+    text_port: int = field(
+        default=12347,
+        metadata={
+            "help": "The port number for sending text data. Default is 12347."
+        },
+    )
 
 
 @dataclass
@@ -307,13 +245,13 @@ class VADHandler(BaseHandler):
 @dataclass
 class WhisperSTTHandlerArguments:
     stt_model_name: str = field(
-        default="distil-whisper/distil-large-v3",
+        default="openai/whisper-large-v3",
         metadata={
             "help": "The pretrained Whisper model to use. Default is 'distil-whisper/distil-large-v3'."
         },
     )
     stt_device: str = field(
-        default="cuda",
+        default="cuda:0",
         metadata={
             "help": "The device type on which the model will run. Default is 'cuda' for GPU acceleration."
         },
@@ -355,169 +293,62 @@ class WhisperSTTHandlerArguments:
     #     },
     # )
     stt_gen_language: str = field(
-         default="jp",
+         default="ja",
          metadata={
              "help": "The language of the speech to transcribe. Default is 'en' for English."
          },
      )
 
-
-class WhisperSTTHandler(BaseHandler):
-    """
-    Handles the Speech To Text generation using a Whisper model.
-    """
-
-    def setup(
-        self,
-        model_name="distil-whisper/distil-large-v3",
-        device="cuda",
-        torch_dtype="float16",
-        compile_mode=None,
-        gen_kwargs={},
-    ):
-        self.device = device
-        self.torch_dtype = getattr(torch, torch_dtype)
-        self.compile_mode = compile_mode
-        self.gen_kwargs = gen_kwargs
-
-        self.processor = AutoProcessor.from_pretrained(model_name)
-        self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            model_name,
-            torch_dtype=self.torch_dtype,
-        ).to(device)
-
-        # compile
-        if self.compile_mode:
-            self.model.generation_config.cache_implementation = "static"
-            self.model.forward = torch.compile(
-                self.model.forward, mode=self.compile_mode, fullgraph=True
-            )
-        self.warmup()
-
-    def prepare_model_inputs(self, spoken_prompt):
-        input_features = self.processor(
-            spoken_prompt, sampling_rate=16000, return_tensors="pt"
-        ).input_features
-        input_features = input_features.to(self.device, dtype=self.torch_dtype)
-
-        return input_features
-
-    def warmup(self):
-        logger.info(f"Warming up {self.__class__.__name__}")
-
-        # 2 warmup steps for no compile or compile mode with CUDA graphs capture
-        n_steps = 1 if self.compile_mode == "default" else 2
-        dummy_input = torch.randn(
-            (1, self.model.config.num_mel_bins, 3000),
-            dtype=self.torch_dtype,
-            device=self.device,
-        )
-        if self.compile_mode not in (None, "default"):
-            # generating more tokens than previously will trigger CUDA graphs capture
-            # one should warmup with a number of generated tokens above max tokens targeted for subsequent generation
-            warmup_gen_kwargs = {
-                "min_new_tokens": self.gen_kwargs["max_new_tokens"],
-                "max_new_tokens": self.gen_kwargs["max_new_tokens"],
-                **self.gen_kwargs,
-            }
-        else:
-            warmup_gen_kwargs = self.gen_kwargs
-
-        if self.device == "cuda":
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            torch.cuda.synchronize()
-            start_event.record()
-
-        for _ in range(n_steps):
-            _ = self.model.generate(dummy_input, **warmup_gen_kwargs)
-
-        if self.device == "cuda":
-            end_event.record()
-            torch.cuda.synchronize()
-
-            logger.info(
-                f"{self.__class__.__name__}:  warmed up! time: {start_event.elapsed_time(end_event) * 1e-3:.3f} s"
-            )
-
-    def process(self, spoken_prompt):
-        logger.debug("infering whisper...")
-
-        global pipeline_start
-        pipeline_start = perf_counter()
-
-        input_features = self.prepare_model_inputs(spoken_prompt)
-        pred_ids = self.model.generate(input_features, **self.gen_kwargs)
-        pred_text = self.processor.batch_decode(
-            pred_ids, skip_special_tokens=True, decode_with_timestamps=False
-        )[0]
-
-        logger.debug("finished whisper inference")
-        console.print(f"[yellow]USER: {pred_text}")
-
-        yield pred_text
-
-
 @dataclass
 class LanguageModelHandlerArguments:
     lm_model_name: str = field(
-        default="HuggingFaceTB/SmolLM-360M-Instruct",
+        default="cyberagent/calm3-22b-chat",
         metadata={
-            "help": "The pretrained language model to use. Default is 'microsoft/Phi-3-mini-4k-instruct'."
+            "help": "The pretrained language model to use. Default is 'deepseek-chat'."
         },
     )
-    lm_device: str = field(
-        default="cuda",
-        metadata={
-            "help": "The device type on which the model will run. Default is 'cuda' for GPU acceleration."
-        },
-    )
-    lm_torch_dtype: str = field(
-        default="float16",
-        metadata={
-            "help": "The PyTorch data type for the model and input tensors. One of `float32` (full-precision), `float16` or `bfloat16` (both half-precision)."
-        },
-    )
-    user_role: str = field(
+    lm_user_role: str = field(
         default="user",
         metadata={
             "help": "Role assigned to the user in the chat context. Default is 'user'."
         },
     )
-    init_chat_role: str = field(
-        default='system',
+    lm_init_chat_role: str = field(
+        default="system",
         metadata={
             "help": "Initial role for setting up the chat context. Default is 'system'."
         },
     )
-    init_chat_prompt: str = field(
-        default="You are a helpful and friendly AI assistant. You are polite, respectful, and aim to provide concise responses of less than 20 words.",
+    lm_init_chat_prompt: str = field(
+        default="あなたは日本語に堪能な友人です。英語を使ってはいけません。全て日本語で回答します. You must answer in Japanese",
         metadata={
             "help": "The initial chat prompt to establish context for the language model. Default is 'You are a helpful AI assistant.'"
         },
     )
-    lm_gen_max_new_tokens: int = field(
-        default=128,
-        metadata={
-            "help": "Maximum number of new tokens to generate in a single completion. Default is 128."
-        },
-    )
-    lm_gen_temperature: float = field(
-        default=0.0,
-        metadata={
-            "help": "Controls the randomness of the output. Set to 0.0 for deterministic (repeatable) outputs. Default is 0.0."
-        },
-    )
-    lm_gen_do_sample: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to use sampling; set this to False for deterministic outputs. Default is False."
-        },
-    )
-    chat_size: int = field(
-        default=2,
+
+    lm_chat_size: int = field(
+        default=20,
         metadata={
             "help": "Number of interactions assitant-user to keep for the chat. None for no limitations."
+        },
+    )
+    lm_api_key: str = field(
+        default="EMPTY",
+        metadata={
+            "help": "Is a unique code used to authenticate and authorize access to an API.Default is None"
+        },
+    )
+    lm_base_url: str = field(
+        default="http://0.0.0.0:8000/v1",
+        metadata={
+            "help": "Is the root URL for all endpoints of an API, serving as the starting point for constructing API request.Default is Non"
+        },
+    )
+    lm_stream: bool = field(
+        default=True,
+        metadata={
+            "help": "The stream parameter typically indicates whether data should be transmitted in a continuous flow rather"
+                    " than in a single, complete response, often used for handling large or real-time data.Default is False"
         },
     )
 
@@ -549,336 +380,6 @@ class Chat:
             return self.buffer
 
 
-class LanguageModelHandler(BaseHandler):
-    """
-    Handles the language model part.
-    """
-
-    def setup(
-        self,
-        model_name="microsoft/Phi-3-mini-4k-instruct",
-        device="cuda",
-        torch_dtype="float16",
-        gen_kwargs={},
-        user_role="user",
-        chat_size=1,
-        init_chat_role=None,
-        init_chat_prompt="You are a helpful AI assistant.",
-    ):
-        self.device = device
-        self.torch_dtype = getattr(torch, torch_dtype)
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch_dtype, trust_remote_code=True
-        ).to(device)
-        self.pipe = pipeline(
-            "text-generation", model=self.model, tokenizer=self.tokenizer, device=device
-        )
-        self.streamer = TextIteratorStreamer(
-            self.tokenizer,
-            skip_prompt=True,
-            skip_special_tokens=True,
-        )
-        self.gen_kwargs = {
-            "streamer": self.streamer,
-            "return_full_text": False,
-            **gen_kwargs,
-        }
-
-        self.chat = Chat(chat_size)
-        if init_chat_role:
-            if not init_chat_prompt:
-                raise ValueError(
-                    "An initial promt needs to be specified when setting init_chat_role."
-                )
-            self.chat.init_chat({"role": init_chat_role, "content": init_chat_prompt})
-        self.user_role = user_role
-
-        self.warmup()
-
-    def warmup(self):
-        logger.info(f"Warming up {self.__class__.__name__}")
-
-        dummy_input_text = "Write me a poem about Machine Learning."
-        dummy_chat = [{"role": self.user_role, "content": dummy_input_text}]
-        warmup_gen_kwargs = {
-            "min_new_tokens": self.gen_kwargs["max_new_tokens"],
-            "max_new_tokens": self.gen_kwargs["max_new_tokens"],
-            **self.gen_kwargs,
-        }
-
-        n_steps = 2
-
-        if self.device == "cuda":
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            torch.cuda.synchronize()
-            start_event.record()
-
-        for _ in range(n_steps):
-            thread = Thread(
-                target=self.pipe, args=(dummy_chat,), kwargs=warmup_gen_kwargs
-            )
-            thread.start()
-            for _ in self.streamer:
-                pass
-
-        if self.device == "cuda":
-            end_event.record()
-            torch.cuda.synchronize()
-
-            logger.info(
-                f"{self.__class__.__name__}:  warmed up! time: {start_event.elapsed_time(end_event) * 1e-3:.3f} s"
-            )
-
-    def process(self, prompt):
-        logger.debug("infering language model...")
-
-        self.chat.append({"role": self.user_role, "content": prompt})
-        thread = Thread(
-            target=self.pipe, args=(self.chat.to_list(),), kwargs=self.gen_kwargs
-        )
-        thread.start()
-        if self.device == "mps":
-            generated_text = ""
-            for new_text in self.streamer:
-                generated_text += new_text
-            printable_text = generated_text
-            torch.mps.empty_cache()
-        else:
-            generated_text, printable_text = "", ""
-            for new_text in self.streamer:
-                generated_text += new_text
-                printable_text += new_text
-                sentences = sent_tokenize(printable_text)
-                if len(sentences) > 1:
-                    yield (sentences[0])
-                    printable_text = new_text
-
-        self.chat.append({"role": "assistant", "content": generated_text})
-
-        # don't forget last sentence
-        yield printable_text
-
-
-@dataclass
-class ParlerTTSHandlerArguments:
-    tts_model_name: str = field(
-        default="ylacombe/parler-tts-mini-jenny-30H",
-        metadata={
-            "help": "The pretrained TTS model to use. Default is 'ylacombe/parler-tts-mini-jenny-30H'."
-        },
-    )
-    tts_device: str = field(
-        default="cuda",
-        metadata={
-            "help": "The device type on which the model will run. Default is 'cuda' for GPU acceleration."
-        },
-    )
-    tts_torch_dtype: str = field(
-        default="float16",
-        metadata={
-            "help": "The PyTorch data type for the model and input tensors. One of `float32` (full-precision), `float16` or `bfloat16` (both half-precision)."
-        },
-    )
-    tts_compile_mode: str = field(
-        default=None,
-        metadata={
-            "help": "Compile mode for torch compile. Either 'default', 'reduce-overhead' and 'max-autotune'. Default is None (no compilation)"
-        },
-    )
-    tts_gen_min_new_tokens: int = field(
-        default=64,
-        metadata={
-            "help": "Maximum number of new tokens to generate in a single completion. Default is 10, which corresponds to ~0.1 secs"
-        },
-    )
-    tts_gen_max_new_tokens: int = field(
-        default=512,
-        metadata={
-            "help": "Maximum number of new tokens to generate in a single completion. Default is 256, which corresponds to ~6 secs"
-        },
-    )
-    description: str = field(
-        default=(
-            "A female speaker with a slightly low-pitched voice delivers her words quite expressively, in a very confined sounding environment with clear audio quality. "
-            "She speaks very fast."
-        ),
-        metadata={
-            "help": "Description of the speaker's voice and speaking style to guide the TTS model."
-        },
-    )
-    play_steps_s: float = field(
-        default=1.0,
-        metadata={
-            "help": "The time interval in seconds for playing back the generated speech in steps. Default is 0.5 seconds."
-        },
-    )
-    max_prompt_pad_length: int = field(
-        default=8,
-        metadata={
-            "help": "When using compilation, the prompt as to be padded to closest power of 2. This parameters sets the maximun power of 2 possible."
-        },
-    )
-
-
-class ParlerTTSHandler(BaseHandler):
-    def setup(
-        self,
-        should_listen,
-        model_name="ylacombe/parler-tts-mini-jenny-30H",
-        device="cuda",
-        torch_dtype="float16",
-        compile_mode=None,
-        gen_kwargs={},
-        max_prompt_pad_length=8,
-        description=(
-            "A female speaker with a slightly low-pitched voice delivers her words quite expressively, in a very confined sounding environment with clear audio quality. "
-            "She speaks very fast."
-        ),
-        play_steps_s=1,
-        blocksize=512,
-    ):
-        self.should_listen = should_listen
-        self.device = device
-        self.torch_dtype = getattr(torch, torch_dtype)
-        self.gen_kwargs = gen_kwargs
-        self.compile_mode = compile_mode
-        self.max_prompt_pad_length = max_prompt_pad_length
-        self.description = description
-
-        self.description_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.prompt_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = ParlerTTSForConditionalGeneration.from_pretrained(
-            model_name, torch_dtype=self.torch_dtype
-        ).to(device)
-
-        framerate = self.model.audio_encoder.config.frame_rate
-        self.play_steps = int(framerate * play_steps_s)
-        self.blocksize = blocksize
-
-        if self.compile_mode not in (None, "default"):
-            logger.warning(
-                "Torch compilation modes that captures CUDA graphs are not yet compatible with the STT part. Reverting to 'default'"
-            )
-            self.compile_mode = "default"
-
-        if self.compile_mode:
-            self.model.generation_config.cache_implementation = "static"
-            self.model.forward = torch.compile(
-                self.model.forward, mode=self.compile_mode, fullgraph=True
-            )
-
-        self.warmup()
-
-    def prepare_model_inputs(
-        self,
-        prompt,
-        max_length_prompt=50,
-        pad=False,
-    ):
-        pad_args_prompt = (
-            {"padding": "max_length", "max_length": max_length_prompt} if pad else {}
-        )
-
-        tokenized_description = self.description_tokenizer(
-            self.description, return_tensors="pt"
-        )
-        input_ids = tokenized_description.input_ids.to(self.device)
-        attention_mask = tokenized_description.attention_mask.to(self.device)
-
-        tokenized_prompt = self.prompt_tokenizer(
-            prompt, return_tensors="pt", **pad_args_prompt
-        )
-        prompt_input_ids = tokenized_prompt.input_ids.to(self.device)
-        prompt_attention_mask = tokenized_prompt.attention_mask.to(self.device)
-
-        gen_kwargs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "prompt_input_ids": prompt_input_ids,
-            "prompt_attention_mask": prompt_attention_mask,
-            **self.gen_kwargs,
-        }
-
-        return gen_kwargs
-
-    def warmup(self):
-        logger.info(f"Warming up {self.__class__.__name__}")
-
-        if self.device == "cuda":
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-
-        # 2 warmup steps for no compile or compile mode with CUDA graphs capture
-        n_steps = 1 if self.compile_mode == "default" else 2
-
-        if self.device == "cuda":
-            torch.cuda.synchronize()
-            start_event.record()
-        if self.compile_mode:
-            pad_lengths = [2**i for i in range(2, self.max_prompt_pad_length)]
-            for pad_length in pad_lengths[::-1]:
-                model_kwargs = self.prepare_model_inputs(
-                    "dummy prompt", max_length_prompt=pad_length, pad=True
-                )
-                for _ in range(n_steps):
-                    _ = self.model.generate(**model_kwargs)
-                logger.info(f"Warmed up length {pad_length} tokens!")
-        else:
-            model_kwargs = self.prepare_model_inputs("dummy prompt")
-            for _ in range(n_steps):
-                _ = self.model.generate(**model_kwargs)
-
-        if self.device == "cuda":
-            end_event.record()
-            torch.cuda.synchronize()
-            logger.info(
-                f"{self.__class__.__name__}:  warmed up! time: {start_event.elapsed_time(end_event) * 1e-3:.3f} s"
-            )
-
-    def process(self, llm_sentence):
-        console.print(f"[green]ASSISTANT: {llm_sentence}")
-        nb_tokens = len(self.prompt_tokenizer(llm_sentence).input_ids)
-
-        pad_args = {}
-        if self.compile_mode:
-            # pad to closest upper power of two
-            pad_length = next_power_of_2(nb_tokens)
-            logger.debug(f"padding to {pad_length}")
-            pad_args["pad"] = True
-            pad_args["max_length_prompt"] = pad_length
-
-        tts_gen_kwargs = self.prepare_model_inputs(
-            llm_sentence,
-            **pad_args,
-        )
-
-        streamer = ParlerTTSStreamer(
-            self.model, device=self.device, play_steps=self.play_steps
-        )
-        tts_gen_kwargs = {"streamer": streamer, **tts_gen_kwargs}
-        torch.manual_seed(0)
-        thread = Thread(target=self.model.generate, kwargs=tts_gen_kwargs)
-        thread.start()
-
-        for i, audio_chunk in enumerate(streamer):
-            if i == 0:
-                logger.info(
-                    f"Time to first audio: {perf_counter() - pipeline_start:.3f}"
-                )
-            audio_chunk = librosa.resample(audio_chunk, orig_sr=44100, target_sr=16000)
-            audio_chunk = (audio_chunk * 32768).astype(np.int16)
-            for i in range(0, len(audio_chunk), self.blocksize):
-                yield np.pad(
-                    audio_chunk[i : i + self.blocksize],
-                    (0, self.blocksize - len(audio_chunk[i : i + self.blocksize])),
-                )
-
-        self.should_listen.set()
-
-
 def prepare_args(args, prefix):
     """
     Rename arguments by removing the prefix and prepares the gen_kwargs.
@@ -906,7 +407,7 @@ def main():
             VADHandlerArguments,
             WhisperSTTHandlerArguments,
             LanguageModelHandlerArguments,
-            ParlerTTSHandlerArguments,
+            SocketTextSenderArguments
         )
     )
 
@@ -920,7 +421,7 @@ def main():
             vad_handler_kwargs,
             whisper_stt_handler_kwargs,
             language_model_handler_kwargs,
-            parler_tts_handler_kwargs,
+            socket_text_sender_kwargs
         ) = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         # Parse arguments from command line if no JSON file is provided
@@ -931,7 +432,7 @@ def main():
             vad_handler_kwargs,
             whisper_stt_handler_kwargs,
             language_model_handler_kwargs,
-            parler_tts_handler_kwargs,
+            socket_text_sender_kwargs
         ) = parser.parse_args_into_dataclasses()
 
     # 1. Handle logger
@@ -961,13 +462,12 @@ def main():
     overwrite_device_argument(
         module_kwargs.device,
         language_model_handler_kwargs,
-        parler_tts_handler_kwargs,
         whisper_stt_handler_kwargs,
     )
 
     prepare_args(whisper_stt_handler_kwargs, "stt")
     prepare_args(language_model_handler_kwargs, "lm")
-    prepare_args(parler_tts_handler_kwargs, "tts")
+    # prepare_args(tts, "tts")
 
     # 3. Build the pipeline
     stop_event = Event()
@@ -978,30 +478,37 @@ def main():
     spoken_prompt_queue = Queue()
     text_prompt_queue = Queue()
     lm_response_queue = Queue()
+    text_out_queue = Queue()
 
-    if module_kwargs.mode == "local":
-        local_audio_streamer = LocalAudioStreamer(
-            input_queue=recv_audio_chunks_queue, output_queue=send_audio_chunks_queue
-        )
-        comms_handlers = [local_audio_streamer]
-        should_listen.set()
-    else:
-        comms_handlers = [
-            SocketReceiver(
-                stop_event,
-                recv_audio_chunks_queue,
-                should_listen,
-                host=socket_receiver_kwargs.recv_host,
-                port=socket_receiver_kwargs.recv_port,
-                chunk_size=socket_receiver_kwargs.chunk_size,
-            ),
-            SocketSender(
-                stop_event,
-                send_audio_chunks_queue,
-                host=socket_sender_kwargs.send_host,
-                port=socket_sender_kwargs.send_port,
-            ),
-        ]
+    # if module_kwargs.mode == "local":
+    #     local_audio_streamer = LocalAudioStreamer(
+    #         input_queue=recv_audio_chunks_queue, output_queue=send_audio_chunks_queue
+    #     )
+    #     comms_handlers = [local_audio_streamer]
+    #     should_listen.set()
+    # else:
+    comms_handlers = [
+        SocketReceiver(
+            stop_event,
+            recv_audio_chunks_queue,
+            should_listen,
+            host=socket_receiver_kwargs.recv_host,
+            port=socket_receiver_kwargs.recv_port,
+            chunk_size=socket_receiver_kwargs.chunk_size,
+        ),
+        SocketSender(
+            stop_event,
+            send_audio_chunks_queue,
+            host=socket_sender_kwargs.send_host,
+            port=socket_sender_kwargs.send_port,
+        ),
+        SocketTextSender(
+            stop_event,
+            text_out_queue,
+            host=socket_text_sender_kwargs.text_host,
+            port=socket_text_sender_kwargs.text_port,
+        ),
+    ]
 
     vad = VADHandler(
         stop_event,
@@ -1010,25 +517,24 @@ def main():
         setup_args=(should_listen,),
         setup_kwargs=vars(vad_handler_kwargs),
     )
-    stt = LightningWhisperSTTHandler(
+    stt =  WhisperSTTHandler(
         stop_event,
         queue_in=spoken_prompt_queue,
         queue_out=text_prompt_queue,
-        setup_kwargs=vars(whisper_stt_handler_kwargs),
+        setup_kwargs={
+            **vars(whisper_stt_handler_kwargs),
+            "stt_broadcast_queue": text_out_queue,
+        },
     )
-    lm = MLXLanguageModelHandler(
+    lm = OpenApiModelHandler(
         stop_event,
         queue_in=text_prompt_queue,
         queue_out=lm_response_queue,
-        setup_kwargs=vars(language_model_handler_kwargs),
+        setup_kwargs={
+            **vars(language_model_handler_kwargs),
+            "llm_broadcast_queue": text_out_queue,
+        },
     )
-    # tts = ParlerTTSHandler(
-    #     stop_event,
-    #     queue_in=lm_response_queue,
-    #     queue_out=send_audio_chunks_queue,
-    #     setup_args=(should_listen,),
-    #     setup_kwargs=vars(parler_tts_handler_kwargs),
-    # )
     tts = MeloTTSHandler(
         stop_event,
         queue_in=lm_response_queue,
@@ -1038,7 +544,9 @@ def main():
 
     # 4. Run the pipeline
     try:
-        pipeline_manager = ThreadManager([*comms_handlers, vad, stt, lm, tts])
+        pipeline_manager = ThreadManager([
+            *comms_handlers, vad, stt, lm, tts,
+        ])
         pipeline_manager.start()
 
     except KeyboardInterrupt:
