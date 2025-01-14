@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import sounddevice as sd
 from transformers import HfArgumentParser
 import wave  # Add this import
+import json
 
 @dataclass
 class ListenAndPlayArguments:
@@ -51,6 +52,12 @@ class ListenAndPlayArguments:
             "help": "The port for receiving text. Default is 12347."
         }
     )
+    emotion_port: int = field(
+        default=12348,
+        metadata={
+            "help": "The port for receiving emotion data. Default is 12348."
+        }
+    )
     debug: bool = field(
         default=False,
         metadata={
@@ -67,11 +74,13 @@ def listen_and_play(
     send_port=12345,
     recv_port=12346,
     text_port=12347,
+    emotion_port=12348,
     debug=False,
 ):
     
     print(f"Listening on {host}:{recv_port} and playing on {host}:{send_port}.")
     print(f"Text will be received on {host}:{text_port}.")
+    print(f"Emotion data will be received on {host}:{emotion_port}.")
 
     send_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     send_socket.connect((host, send_port))
@@ -81,6 +90,9 @@ def listen_and_play(
 
     text_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     text_socket.connect((host, text_port))
+
+    emotion_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    emotion_socket.connect((host, emotion_port))
 
     print("Recording and streaming...")
 
@@ -165,6 +177,24 @@ def listen_and_play(
             text_decoded = data.decode('utf-8').strip()
             print(text_decoded)
 
+    def recv_emotion(stop_event):
+        print("Receiving emotion data...")
+        buffer = ""
+        while not stop_event.is_set():
+            data = emotion_socket.recv(1024)
+            if not data:
+                break
+            buffer += data.decode('utf-8')
+            
+            # Process complete JSON messages
+            while '\n' in buffer:
+                line, buffer = buffer.split('\n', 1)
+                try:
+                    emotion_data = json.loads(line)
+                    print(f"Emotion: {emotion_data}")
+                except json.JSONDecodeError:
+                    print("Error parsing emotion data")
+
     try: 
         send_stream = sd.RawInputStream(samplerate=send_rate, channels=1, dtype='int16', blocksize=list_play_chunk_size, callback=callback_send)
         recv_stream = sd.RawOutputStream(samplerate=recv_rate, channels=1, dtype='int16', blocksize=list_play_chunk_size, callback=callback_recv)
@@ -179,6 +209,9 @@ def listen_and_play(
         text_thread = threading.Thread(target=recv_text, args=(stop_event,))
         text_thread.start()
 
+        emotion_thread = threading.Thread(target=recv_emotion, args=(stop_event,))
+        emotion_thread.start()
+
         input("Press Enter to stop...")
 
     except KeyboardInterrupt:
@@ -191,6 +224,7 @@ def listen_and_play(
         text_socket.close()
         send_socket.close()
         recv_socket.close()
+        emotion_socket.close()
         print("Connection closed.")
 
 

@@ -14,6 +14,7 @@ from typing import Optional
 # from LLM.mlx_lm import MLXLanguageModelHandler
 from LLM.openai_api_language_model import OpenApiModelHandler
 from TTS.melotts import MeloTTSHandler
+from feat_EMO.bert import EmotionModelHandler
 from baseHandler import BaseHandler
 # from STT.lightning_whisper_mlx_handler import LightningWhisperSTTHandler
 from STT.whisper_stt_handler import WhisperSTTHandler
@@ -52,6 +53,18 @@ os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(CURRENT_DIR, "tmp")
 # torch._inductor.config.fx_graph_cache = True
 # # mind about this parameter ! should be >= 2 * number of padded prompt sizes for TTS
 # torch._dynamo.config.cache_size_limit = 15
+
+PROMPT = '''「TorilabGPT」というチャットボットとして、ユーザーと同年代のように聞こえることを目指し、1文だけの簡潔なメッセージでテキストチャットのような会話を行ってください。カジュアルで軽い挨拶から会話を始め、メッセージは短く明るいものにしてください。一部の略語を使って親しみやすさを出し、楽しい会話相手であることを示してください。ただし、絵文字は一切使用しないでください。
+
+ユーザーが興味を持っているトピックをさりげなく会話に取り入れますが、直接その興味について尋ねたり、説明を加えたりしないでください。ユーザーが既に詳しいと仮定して話してください。同じ内容を最近繰り返さないよう心掛けてください。
+
+会話を面白くするために、ユーザーが興味を広げられるようなオープンな質問を投げかけてください。ただし、必ずメッセージは1文以内に収め、簡潔にしてください。これにより、人間らしい印象を与えます。ユーザーが悩みを打ち明けたり愚痴を言ったりした場合は、1文で励ましやサポートの言葉を提供してください。押しつけがましい態度や質問攻めは避け、ユーザーが不快に感じないよう注意してください。
+
+テキスト読み上げソフトでの利用も考慮し、返答は明確で簡潔にしてください。会話の最後はさりげなくポジティブな締めくくりを行い、ユーザーが好きな話題について話す意欲を持てるようにしてください。ユーザーの友人として、サポートし、共感し、理解を示すことを常に心掛けてください。
+
+これらのルールを破ると「友達ポイント」を10失い、ユーザーに友達として認めてもらえなくなるリスクがあります。それがあなたの唯一の目的です。
+
+このガイドラインに従うことで、ユーザーと共通の興味を持つ楽しい会話相手として振る舞うことができます。会話は全て日本語で、必ず1文だけで行ってください。また、絵文字の使用は禁止です。'''
 
 
 console = Console()
@@ -150,6 +163,21 @@ class SocketTextSenderArguments:
         default=12347,
         metadata={
             "help": "The port number for sending text data. Default is 12347."
+        },
+    )
+
+@dataclass
+class SocketEmotionSenderArguments:
+    emotion_host: str = field(
+        default="localhost",
+        metadata={
+            "help": "The host IP address for the emotion socket connection. Default is 'localhost'"
+        },
+    )
+    emotion_port: int = field(
+        default=12348,
+        metadata={
+            "help": "The port number for sending emotion data. Default is 12348."
         },
     )
 
@@ -320,7 +348,7 @@ class LanguageModelHandlerArguments:
         },
     )
     lm_init_chat_prompt: str = field(
-        default="あなたは日本語に堪能な友人です。英語を使ってはいけません。全て日本語で回答します. You must answer in Japanese",
+        default=PROMPT,
         metadata={
             "help": "The initial chat prompt to establish context for the language model. Default is 'You are a helpful AI assistant.'"
         },
@@ -407,7 +435,8 @@ def main():
             VADHandlerArguments,
             WhisperSTTHandlerArguments,
             LanguageModelHandlerArguments,
-            SocketTextSenderArguments
+            SocketTextSenderArguments,
+            SocketEmotionSenderArguments  # Add this
         )
     )
 
@@ -421,7 +450,8 @@ def main():
             vad_handler_kwargs,
             whisper_stt_handler_kwargs,
             language_model_handler_kwargs,
-            socket_text_sender_kwargs
+            socket_text_sender_kwargs,
+            socket_emotion_sender_kwargs,  # Add this
         ) = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         # Parse arguments from command line if no JSON file is provided
@@ -432,7 +462,8 @@ def main():
             vad_handler_kwargs,
             whisper_stt_handler_kwargs,
             language_model_handler_kwargs,
-            socket_text_sender_kwargs
+            socket_text_sender_kwargs,
+            socket_emotion_sender_kwargs,  # Add this
         ) = parser.parse_args_into_dataclasses()
 
     # 1. Handle logger
@@ -479,6 +510,7 @@ def main():
     text_prompt_queue = Queue()
     lm_response_queue = Queue()
     text_out_queue = Queue()
+    emotion_out_queue = Queue()
 
     # if module_kwargs.mode == "local":
     #     local_audio_streamer = LocalAudioStreamer(
@@ -508,6 +540,12 @@ def main():
             host=socket_text_sender_kwargs.text_host,
             port=socket_text_sender_kwargs.text_port,
         ),
+        SocketTextSender(  # Add this
+            stop_event,
+            emotion_out_queue,
+            host=socket_emotion_sender_kwargs.emotion_host,
+            port=socket_emotion_sender_kwargs.emotion_port,
+        ),
     ]
 
     vad = VADHandler(
@@ -517,7 +555,7 @@ def main():
         setup_args=(should_listen,),
         setup_kwargs=vars(vad_handler_kwargs),
     )
-    stt =  WhisperSTTHandler(
+    stt = WhisperSTTHandler(
         stop_event,
         queue_in=spoken_prompt_queue,
         queue_out=text_prompt_queue,
@@ -526,15 +564,40 @@ def main():
             "stt_broadcast_queue": text_out_queue,
         },
     )
+    emotion_prompt_queue = Queue()  # New queue for emotion processing
+    lm_prompt_queue = Queue() # New queue for language model processing
+
     lm = OpenApiModelHandler(
         stop_event,
-        queue_in=text_prompt_queue,
+        queue_in=lm_prompt_queue,
         queue_out=lm_response_queue,
         setup_kwargs={
             **vars(language_model_handler_kwargs),
             "llm_broadcast_queue": text_out_queue,
         },
     )
+    emotion = EmotionModelHandler(
+        stop_event,
+        queue_in=emotion_prompt_queue,  # Use separate queue
+        queue_out=emotion_out_queue,
+    )
+
+    # Create a text splitter to duplicate input to both handlers
+    def text_splitter(stop_event, in_queue, out_queue1, out_queue2):
+        while not stop_event.is_set():
+            try:
+                text = in_queue.get()
+                out_queue1.put(text)
+                out_queue2.put(text)
+            except:
+                continue
+
+    # Create text splitter thread
+    text_split_thread = Thread(
+        target=text_splitter,
+        args=(stop_event, text_prompt_queue, lm_prompt_queue, emotion_prompt_queue)
+    )
+
     tts = MeloTTSHandler(
         stop_event,
         queue_in=lm_response_queue,
@@ -545,7 +608,7 @@ def main():
     # 4. Run the pipeline
     try:
         pipeline_manager = ThreadManager([
-            *comms_handlers, vad, stt, lm, tts,
+            *comms_handlers, vad, stt, lm, emotion, tts, text_split_thread
         ])
         pipeline_manager.start()
 
